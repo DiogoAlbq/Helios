@@ -4,6 +4,8 @@
 
 # Helios
 
+[![Tests](https://github.com/DiogoAlbq/Helios/actions/workflows/test.yml/badge.svg)](https://github.com/DiogoAlbq/Helios/actions/workflows/test.yml)
+
 Steam launch wrapper for NVIDIA GPUs on Linux, written in Bash.
 
 Detects the GPU tier via `nvidia-smi`, composes Proton/DXVK/VKD3D environment variables using profile algebra, and passes the game command through `exec` without interfering with Steam's `--` arguments.
