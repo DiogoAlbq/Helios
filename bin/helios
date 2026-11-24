@@ -70,16 +70,13 @@ readonly -a UNSAFE_PROFILES=(
     vkd3d_latency
 )
 
-# Built-in Steam AppIDs known to use kernel/strict anticheat.
+# Built-in Steam AppIDs for competitive games that run on Linux.
 declare -A BUILTIN_COMPETITIVE_APPS=(
     [730]="1"       # Counter-Strike 2
-    [1172470]="1"   # Apex Legends
-    [1085660]="1"   # Destiny 2
-    [359550]="1"    # Rainbow Six Siege
-    [578080]="1"    # PUBG: BATTLEGROUNDS
-    [1517290]="1"   # Battlefield 2042
-    [1938090]="1"   # Call of Duty
+    [570]="1"       # Dota 2
+    [440]="1"       # Team Fortress 2
     [2357570]="1"   # Overwatch 2
+    [252490]="1"    # Rust
 )
 
 if [[ -t 2 && -z "${NO_COLOR:-}" ]]; then

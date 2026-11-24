@@ -28,7 +28,7 @@ HELIOS_ALIAS_battery="perf"
 # HELIOS_PROFILE_mycustom="DXVK_HUD=fps PROTON_ENABLE_NVAPI=1"
 
 # Competitive games with anticheat (HELIOS_COMPETITIVE_<appid>="1")
-# Built-in list already covers CS2, Apex, Destiny 2, R6 Siege, PUBG, BF2042, CoD, OW2.
+# Built-in list covers CS2, Dota 2, TF2, Overwatch 2, Rust.
 # HELIOS_COMPETITIVE_123456="1"
 
 # Profile used instead of 'auto' / 'ultra' when running on battery (Discharging).
