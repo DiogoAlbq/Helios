@@ -1,0 +1,1454 @@
+#!/usr/bin/env bash
+# helios - Steam launch option wrapper for NVIDIA GPUs on Linux
+# SPDX-License-Identifier: MIT
+
+set -euo pipefail
+
+readonly HELIOS_VERSION="1.0.0"
+
+readonly CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/helios"
+readonly CONFIG_FILE="$CONFIG_DIR/helios.conf"
+readonly CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/helios"
+
+readonly -a CONFIG_KEY_PREFIXES=(
+    "HELIOS_DEFAULT_PROFILES"
+    "HELIOS_APP_"
+    "HELIOS_ALIAS_"
+    "HELIOS_PROFILE_"
+    "HELIOS_BATTERY_PROFILE"
+    "HELIOS_COMPETITIVE_"
+)
+
+declare -A PROFILE_VARS=(
+    [rt]="VKD3D_CONFIG=dxr,dxr11 PROTON_HIDE_NVIDIA_GPU=0"
+    [dlss]="PROTON_ENABLE_NVAPI=1 DXVK_ENABLE_NVAPI=1 PROTON_HIDE_NVIDIA_GPU=0"
+    [perf]="DXVK_ASYNC=1 __GL_SHADER_DISK_CACHE=1 __GL_SHADER_DISK_CACHE_PATH=${CACHE_DIR}/gl-shader-cache"
+    [fsync]="PROTON_NO_ESYNC=0 PROTON_NO_FSYNC=0"
+    [latency]="__GL_MaxFramesAllowed=1 __GL_SYNC_TO_VBLANK=0"
+    [ngx]="PROTON_ENABLE_NGX_UPDATER=1"
+    [dlss_upgrade]="PROTON_DLSS_UPGRADE=1"
+    [gplasync]="DXVK_GPLASYNC=1"
+    [cache_size]="__GL_SHADER_DISK_CACHE_SIZE=10737418240"
+    [cache_skip_cleanup]="__GL_SHADER_DISK_CACHE_SKIP_CLEANUP=1"
+    [vkd3d_cache]="VKD3D_SHADER_CACHE_PATH=${CACHE_DIR}/vkd3d-shader-cache"
+    [vkd3d_latency]="VKD3D_SWAPCHAIN_LATENCY_FRAMES=1"
+)
+
+declare -A META_PROFILES=(
+    [auto]="auto"
+    [full]="dlss,rt,perf,fsync"
+    [comp]="perf,latency"
+    [competitive]="perf,latency"
+    [re_engine]="dlss,rt,perf,fsync,latency,ngx,dlss_upgrade,gplasync,cache_size,cache_skip_cleanup,vkd3d_cache,vkd3d_latency"
+)
+
+declare -A CUSTOM_PROFILES=()
+declare -A CONFIG=()
+
+declare -A GPU_TIER_MAP=(
+    ["RTX 50"]="blackwell"
+    ["RTX 40"]="ada"
+    ["RTX 30"]="ampere"
+    ["RTX 20"]="turing"
+)
+
+readonly -a BASE_PROFILES=(
+    rt dlss perf fsync latency
+    ngx dlss_upgrade gplasync
+    cache_size cache_skip_cleanup
+    vkd3d_cache vkd3d_latency
+)
+
+# Profiles blocked on games with kernel anticheat unless --unsafe is passed.
+readonly -a UNSAFE_PROFILES=(
+    rt
+    dlss
+    ngx
+    dlss_upgrade
+    gplasync
+    vkd3d_cache
+    vkd3d_latency
+)
+
+# Built-in Steam AppIDs known to use kernel/strict anticheat.
+declare -A BUILTIN_COMPETITIVE_APPS=(
+    [730]="1"       # Counter-Strike 2
+    [1172470]="1"   # Apex Legends
+    [1085660]="1"   # Destiny 2
+    [359550]="1"    # Rainbow Six Siege
+    [578080]="1"    # PUBG: BATTLEGROUNDS
+    [1517290]="1"   # Battlefield 2042
+    [1938090]="1"   # Call of Duty
+    [2357570]="1"   # Overwatch 2
+)
+
+if [[ -t 2 && -z "${NO_COLOR:-}" ]]; then
+    readonly C_RESET=$'\033[0m'
+    readonly C_RED=$'\033[31m'
+    readonly C_YELLOW=$'\033[33m'
+    readonly C_BLUE=$'\033[34m'
+    readonly C_CYAN=$'\033[36m'
+else
+    readonly C_RESET="" C_RED="" C_YELLOW="" C_BLUE="" C_CYAN=""
+fi
+
+VERBOSE=false
+DRY_RUN=false
+FORCE=false
+UNSAFE_MODE=false
+CONFIG_OVERRIDE=""
+GAME_COMMAND=()
+WRAPPER_ARGS=()
+REMAINING_ARGS=()
+PROFILE_VARS_RESULT=()
+
+log_info() {
+    printf '%s[helios]%s %s\n' "$C_BLUE" "$C_RESET" "$*" >&2
+}
+
+log_warn() {
+    printf '%s[helios][warn]%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2
+}
+
+log_error() {
+    printf '%s[helios][error]%s %s\n' "$C_RED" "$C_RESET" "$*" >&2
+}
+
+log_verbose() {
+    if $VERBOSE; then
+        printf '%s[helios]%s %s\n' "$C_CYAN" "$C_RESET" "$*" >&2
+    fi
+}
+
+die() {
+    log_error "$*"
+    exit 1
+}
+
+trim_ws() {
+    local s="$1"
+    s="${s#"${s%%[![:space:]]*}"}"
+    s="${s%"${s##*[![:space:]]}"}"
+    printf '%s' "$s"
+}
+
+# Config parser (line-by-line, never uses source/eval)
+
+validate_config_value() {
+    local val="$1"
+    if [[ "$val" =~ [\$\`\;\|\&\<\>\(\)\\] ]] || [[ "$val" == *$'\n'* ]]; then
+        return 1
+    fi
+    return 0
+}
+
+parse_config_line_into() {
+    local line="$1"
+    local -n target_array="$2"
+    local key="" val=""
+
+    line=$(trim_ws "$line")
+    [[ -z "$line" || "${line:0:1}" == "#" ]] && return 0
+
+    local in_single=0 in_double=0
+    local eq_pos=-1
+    local i ch
+    for ((i=0; i<${#line}; i++)); do
+        ch="${line:i:1}"
+        if [[ "$ch" == "'" && $in_double -eq 0 ]]; then
+            in_single=$((1 - in_single))
+        elif [[ "$ch" == '"' && $in_single -eq 0 ]]; then
+            in_double=$((1 - in_double))
+        elif [[ "$ch" == "=" && $in_single -eq 0 && $in_double -eq 0 ]]; then
+            eq_pos=$i
+            break
+        fi
+    done
+
+    if [[ $eq_pos -eq -1 ]]; then
+        log_warn "Config: malformed line ignored: $line"
+        return 0
+    fi
+
+    key=$(trim_ws "${line:0:eq_pos}")
+    val=$(trim_ws "${line:eq_pos+1}")
+
+    # Strip inline comments outside quotes before unquoting
+    local in_s=0 in_d=0
+    for ((i=0; i<${#val}; i++)); do
+        ch="${val:i:1}"
+        if [[ "$ch" == "'" && $in_d -eq 0 ]]; then
+            in_s=$((1 - in_s))
+        elif [[ "$ch" == '"' && $in_s -eq 0 ]]; then
+            in_d=$((1 - in_d))
+        elif [[ "$ch" == "#" && $in_s -eq 0 && $in_d -eq 0 ]]; then
+            val=$(trim_ws "${val:0:i}")
+            break
+        fi
+    done
+
+    if [[ "${val:0:1}" == '"' && "${val: -1}" == '"' && ${#val} -ge 2 ]]; then
+        val="${val:1:-1}"
+    elif [[ "${val:0:1}" == "'" && "${val: -1}" == "'" && ${#val} -ge 2 ]]; then
+        val="${val:1:-1}"
+    fi
+
+    local valid_key=false prefix
+    for prefix in "${CONFIG_KEY_PREFIXES[@]}"; do
+        if [[ "$key" == "$prefix" || "$key" == "$prefix"* ]]; then
+            valid_key=true
+            break
+        fi
+    done
+    [[ "$valid_key" == false ]] && return 0
+
+    if ! validate_config_value "$val"; then
+        log_warn "Config: rejected value with shell metacharacters for key '$key'"
+        return 0
+    fi
+
+    target_array["$key"]="$val"
+}
+
+parse_config_file_into() {
+    local config_path="$1"
+    local array_name="$2"
+    [[ -f "$config_path" ]] || return 0
+
+    local line
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        parse_config_line_into "$line" "$array_name"
+    done < "$config_path"
+}
+
+load_config() {
+    local config_path="${1:-$CONFIG_FILE}"
+    CONFIG=()
+    CUSTOM_PROFILES=()
+
+    [[ -f "$config_path" ]] || return 0
+
+    local lock_file="${config_path}.lock"
+    exec 9<>"$lock_file"
+    flock -s 9
+    parse_config_file_into "$config_path" CONFIG
+    flock -u 9
+    exec 9<&-
+
+    local key
+    for key in "${!CONFIG[@]}"; do
+        if [[ "$key" == HELIOS_PROFILE_* ]]; then
+            CUSTOM_PROFILES["${key#HELIOS_PROFILE_}"]="${CONFIG[$key]}"
+        fi
+    done
+}
+
+_write_config_locked() {
+    local config_path="$1"
+    shift
+    local -a lines=("$@")
+    local lock_file="${config_path}.lock"
+
+    mkdir -p "$(dirname "$config_path")" 2>/dev/null || true
+    exec 9<>"$lock_file"
+    flock -x 9
+
+    local tmp
+    tmp=$(mktemp "${config_path}.XXXXXX") || {
+        flock -u 9
+        exec 9<&-
+        die "Failed to create temp config"
+    }
+    [[ -f "$config_path" ]] && chmod --reference="$config_path" "$tmp" 2>/dev/null || true
+
+    local line
+    for line in "${lines[@]}"; do
+        printf '%s\n' "$line" >> "$tmp"
+    done
+
+    mv -f "$tmp" "$config_path" || {
+        rm -f "$tmp" 2>/dev/null || true
+        flock -u 9
+        exec 9<&-
+        die "Failed to write config"
+    }
+
+    flock -u 9
+    exec 9<&-
+}
+
+write_config_atomic() {
+    _write_config_locked "$@"
+}
+
+config_write_key() {
+    local key="$1" value="$2" config_path="${3:-$CONFIG_FILE}"
+    local -A current=()
+    parse_config_file_into "$config_path" current
+    current["$key"]="$value"
+
+    local -a lines=()
+    local k
+    for k in $(printf '%s\n' "${!current[@]}" | sort); do
+        lines+=("$k=\"${current[$k]}\"")
+    done
+    _write_config_locked "$config_path" "${lines[@]}"
+}
+
+config_delete_key() {
+    local key="$1" config_path="${2:-$CONFIG_FILE}"
+    local -A current=()
+    parse_config_file_into "$config_path" current
+    unset "current[$key]"
+
+    local -a lines=()
+    local k
+    if (( ${#current[@]} > 0 )); then
+        for k in $(printf '%s\n' "${!current[@]}" | sort); do
+            lines+=("$k=\"${current[$k]}\"")
+        done
+    fi
+    _write_config_locked "$config_path" "${lines[@]}"
+}
+
+# Hardware and Steam environment detection
+
+detect_gpu_tier() {
+    local nvidia_smi_path
+    nvidia_smi_path=$(command -v nvidia-smi 2>/dev/null) || { echo "none"; return 0; }
+
+    local gpu_name
+    gpu_name=$("$nvidia_smi_path" --query-gpu=name --format=csv,noheader 2>/dev/null | head -n1) || { echo "none"; return 0; }
+
+    log_verbose "Detected GPU: $gpu_name"
+
+    local pattern
+    for pattern in "${!GPU_TIER_MAP[@]}"; do
+        if [[ "$gpu_name" == *"$pattern"* ]]; then
+            echo "${GPU_TIER_MAP[$pattern]}"
+            return 0
+        fi
+    done
+
+    if [[ "$gpu_name" == *"RTX"* ]]; then
+        echo "rtx_generic"
+        return 0
+    fi
+
+    if [[ "$gpu_name" == *"GTX"* ]] || [[ "$gpu_name" == *"Quadro"* && "$gpu_name" != *"RTX"* ]]; then
+        echo "pre_rtx"
+        return 0
+    fi
+
+    echo "none"
+}
+
+is_battery_discharging() {
+    local supply type status
+    for supply in /sys/class/power_supply/*; do
+        [[ -f "$supply/type" ]] || continue
+        type=$(<"$supply/type")
+        [[ "$type" == "Battery" ]] || continue
+        status=$(<"$supply/status" 2>/dev/null) || continue
+        [[ "$status" == "Discharging" ]] && return 0
+    done
+    return 1
+}
+
+detect_appid() {
+    local appid=""
+    if [[ -n "${SteamAppId:-}" ]]; then
+        appid="$SteamAppId"
+    elif [[ -n "${STEAM_APP_ID:-}" ]]; then
+        appid="$STEAM_APP_ID"
+    elif [[ -n "${STEAM_COMPAT_DATA_PATH:-}" ]]; then
+        if [[ "$STEAM_COMPAT_DATA_PATH" =~ .*compatdata/([0-9]+) ]]; then
+            appid="${BASH_REMATCH[1]}"
+        fi
+    fi
+    echo "$appid"
+}
+
+is_competitive_game() {
+    $UNSAFE_MODE && return 1
+
+    local appid
+    appid=$(detect_appid)
+    [[ -z "$appid" ]] && return 1
+
+    [[ -n "${BUILTIN_COMPETITIVE_APPS[$appid]:-}" ]] && return 0
+
+    local key="HELIOS_COMPETITIVE_${appid}"
+    [[ -n "${CONFIG[$key]:-}" ]] && return 0
+
+    return 1
+}
+
+filter_unsafe_base_profiles() {
+    local expanded="$1"
+    is_competitive_game || { echo "$expanded"; return 0; }
+
+    log_warn "Competitive game detected (AppID: $(detect_appid)); filtering unsafe profiles"
+
+    local -a safe=()
+    local p u unsafe
+    for p in $expanded; do
+        unsafe=false
+        for u in "${UNSAFE_PROFILES[@]}"; do
+            if [[ "$u" == "$p" ]]; then
+                unsafe=true
+                break
+            fi
+        done
+        if $unsafe; then
+            log_warn "  Blocked profile: $p (use --unsafe to override)"
+        else
+            safe+=("$p")
+        fi
+    done
+
+    echo "${safe[*]}"
+}
+
+# Profile algebra and expansion
+
+is_base_profile() {
+    local p="$1" bp
+    for bp in "${BASE_PROFILES[@]}"; do
+        [[ "$bp" == "$p" ]] && return 0
+    done
+    [[ -n "${CUSTOM_PROFILES[$p]:-}" ]] && return 0
+    return 1
+}
+
+is_meta_profile() {
+    local p="$1"
+    [[ -n "${META_PROFILES[$p]:-}" ]]
+}
+
+expand_profile_token() {
+    local token="$1"
+    local gpu_tier="$2"
+    local battery_profile="${3:-}"
+
+    if is_base_profile "$token"; then
+        echo "$token"
+        return 0
+    fi
+
+    if [[ "$token" == "auto" ]]; then
+        case "$gpu_tier" in
+            blackwell|ada|ampere|turing|rtx_generic)
+                echo "dlss rt perf"
+                ;;
+            pre_rtx)
+                echo "perf"
+                ;;
+            none)
+                if [[ -n "$battery_profile" ]] && is_battery_discharging; then
+                    log_info "Battery discharging: applying battery profile '$battery_profile'"
+                    expand_profiles "$battery_profile" "$gpu_tier" ""
+                else
+                    echo ""
+                fi
+                ;;
+            *)
+                echo "perf"
+                ;;
+        esac
+        return 0
+    fi
+
+    if [[ "$token" == "ultra" ]]; then
+        case "$gpu_tier" in
+            blackwell|ada)
+                echo "dlss rt perf fsync latency ngx dlss_upgrade gplasync cache_size cache_skip_cleanup vkd3d_cache vkd3d_latency"
+                ;;
+            ampere)
+                echo "dlss rt perf fsync latency gplasync cache_size cache_skip_cleanup vkd3d_cache vkd3d_latency"
+                ;;
+            turing)
+                echo "dlss rt perf fsync latency cache_size cache_skip_cleanup vkd3d_cache"
+                ;;
+            rtx_generic)
+                echo "dlss rt perf fsync latency cache_size cache_skip_cleanup vkd3d_cache vkd3d_latency"
+                ;;
+            pre_rtx)
+                echo "perf latency"
+                ;;
+            none)
+                if [[ -n "$battery_profile" ]] && is_battery_discharging; then
+                    log_info "Battery discharging: applying battery profile '$battery_profile'"
+                    expand_profiles "$battery_profile" "$gpu_tier" ""
+                else
+                    echo ""
+                fi
+                ;;
+            *)
+                echo "perf fsync latency"
+                ;;
+        esac
+        return 0
+    fi
+
+    if is_meta_profile "$token"; then
+        echo "${META_PROFILES[$token]//,/ }"
+        return 0
+    fi
+
+    log_warn "Unknown profile token: '$token' (ignored)"
+    echo ""
+}
+
+expand_profiles() {
+    local input="${1:-auto}"
+    local gpu_tier="${2:-$(detect_gpu_tier)}"
+    local battery_profile="${3:-${CONFIG[HELIOS_BATTERY_PROFILE]:-}}"
+
+    local IFS=','
+    local -a tokens=()
+    read -ra tokens <<< "$input"
+
+    local -A add_set=()
+    local -A remove_set=()
+    local token op profile expanded p
+
+    for token in "${tokens[@]}"; do
+        token=$(trim_ws "$token")
+        [[ -z "$token" ]] && continue
+
+        op="+"
+        profile="$token"
+        if [[ "${token:0:1}" == "+" ]]; then
+            profile="${token:1}"
+        elif [[ "${token:0:1}" == "-" ]]; then
+            op="-"
+            profile="${token:1}"
+        fi
+
+        if [[ "$op" == "+" ]]; then
+            expanded=$(expand_profile_token "$profile" "$gpu_tier" "$battery_profile")
+            local IFS=$' \t'
+            for p in $expanded; do
+                add_set["$p"]=1
+            done
+        else
+            if is_base_profile "$profile"; then
+                remove_set["$profile"]=1
+            else
+                log_warn "Removal '-${profile}' applies only to base profiles (ignored)"
+            fi
+        fi
+    done
+
+    for p in "${!remove_set[@]}"; do
+        unset 'add_set[$p]'
+    done
+
+    local -a result=()
+    for p in "${!add_set[@]}"; do
+        result+=("$p")
+    done
+
+    if (( ${#result[@]} > 0 )); then
+        local sorted
+        sorted=$(printf '%s\n' "${result[@]}" | sort)
+        local -a sorted_arr=()
+        mapfile -t sorted_arr <<< "$sorted"
+        echo "${sorted_arr[*]}"
+    else
+        echo ""
+    fi
+}
+
+profile_vars() {
+    local profiles="$1"
+    PROFILE_VARS_RESULT=()
+
+    local p val kv
+    local IFS=$' \t'
+    for p in $profiles; do
+        val=""
+        if [[ -n "${PROFILE_VARS[$p]:-}" ]]; then
+            val="${PROFILE_VARS[$p]}"
+        elif [[ -n "${CUSTOM_PROFILES[$p]:-}" ]]; then
+            val="${CUSTOM_PROFILES[$p]}"
+        else
+            continue
+        fi
+
+        for kv in $val; do
+            kv="${kv//\$\{CACHE_DIR\}/$CACHE_DIR}"
+            kv="${kv//\$\{HOME\}/$HOME}"
+            PROFILE_VARS_RESULT+=("$kv")
+        done
+    done
+}
+
+# Command line parsing
+
+parse_global_flags() {
+    REMAINING_ARGS=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --config)
+                [[ $# -lt 2 ]] && die "--config requires a path"
+                CONFIG_OVERRIDE="$2"
+                shift 2
+                ;;
+            --config=*)
+                CONFIG_OVERRIDE="${1#*=}"
+                shift
+                ;;
+            --verbose|-v)
+                VERBOSE=true
+                shift
+                ;;
+            --dry-run)
+                DRY_RUN=true
+                shift
+                ;;
+            --force)
+                FORCE=true
+                shift
+                ;;
+            --unsafe)
+                UNSAFE_MODE=true
+                shift
+                ;;
+            --)
+                REMAINING_ARGS+=("$@")
+                break
+                ;;
+            *)
+                REMAINING_ARGS+=("$1")
+                shift
+                ;;
+        esac
+    done
+}
+
+parse_wrapper_args() {
+    local -a args=("$@")
+    local -a wrapper=()
+    local -a game=()
+    local found_separator=false
+    local arg
+
+    for arg in "${args[@]}"; do
+        if $found_separator; then
+            game+=("$arg")
+        elif [[ "$arg" == "--" ]]; then
+            found_separator=true
+        else
+            wrapper+=("$arg")
+        fi
+    done
+
+    if ! $found_separator; then
+        local -a new_wrapper=()
+        local -a new_game=()
+        local game_started=false
+        for arg in "${wrapper[@]}"; do
+            if $game_started; then
+                new_game+=("$arg")
+            elif [[ "${arg:0:1}" == "-" ]]; then
+                new_wrapper+=("$arg")
+            else
+                game_started=true
+                new_game+=("$arg")
+            fi
+        done
+        wrapper=("${new_wrapper[@]}")
+        game=("${new_game[@]}")
+    fi
+
+    WRAPPER_ARGS=("${wrapper[@]}")
+    GAME_COMMAND=("${game[@]}")
+}
+
+parse_direct_flags() {
+    local -a profiles_to_add=()
+    local -a profiles_to_remove=()
+    local arg
+
+    for arg in "${WRAPPER_ARGS[@]}"; do
+        case "$arg" in
+            --auto) profiles_to_add+=("auto") ;;
+            --full) profiles_to_add+=("full") ;;
+            --ultra) profiles_to_add+=("ultra") ;;
+            --comp|--competitive) profiles_to_add+=("comp") ;;
+            --rt) profiles_to_add+=("+rt") ;;
+            --no-rt) profiles_to_remove+=("rt") ;;
+            --dlss) profiles_to_add+=("+dlss") ;;
+            --no-dlss) profiles_to_remove+=("dlss") ;;
+            --perf) profiles_to_add+=("+perf") ;;
+            --no-perf) profiles_to_remove+=("perf") ;;
+            --fsync) profiles_to_add+=("+fsync") ;;
+            --no-fsync) profiles_to_remove+=("fsync") ;;
+            --latency) profiles_to_add+=("+latency") ;;
+            --no-latency) profiles_to_remove+=("latency") ;;
+            --ngx) profiles_to_add+=("+ngx") ;;
+            --no-ngx) profiles_to_remove+=("ngx") ;;
+            --dlss-upgrade) profiles_to_add+=("+dlss_upgrade") ;;
+            --no-dlss-upgrade) profiles_to_remove+=("dlss_upgrade") ;;
+            --gplasync) profiles_to_add+=("+gplasync") ;;
+            --no-gplasync) profiles_to_remove+=("gplasync") ;;
+            --cache-size) profiles_to_add+=("+cache_size") ;;
+            --no-cache-size) profiles_to_remove+=("cache_size") ;;
+            --cache-skip-cleanup) profiles_to_add+=("+cache_skip_cleanup") ;;
+            --no-cache-skip-cleanup) profiles_to_remove+=("cache_skip_cleanup") ;;
+            --vkd3d-cache) profiles_to_add+=("+vkd3d_cache") ;;
+            --no-vkd3d-cache) profiles_to_remove+=("vkd3d_cache") ;;
+            --vkd3d-latency) profiles_to_add+=("+vkd3d_latency") ;;
+            --no-vkd3d-latency) profiles_to_remove+=("vkd3d_latency") ;;
+            --profile|--profile=*) ;;
+            --*) die "Unknown flag: $arg" ;;
+        esac
+    done
+
+    local profile_str="" p
+    for p in "${profiles_to_add[@]}"; do
+        profile_str+="${profile_str:+,}$p"
+    done
+    for p in "${profiles_to_remove[@]}"; do
+        profile_str+="${profile_str:+,}-$p"
+    done
+
+    echo "$profile_str"
+}
+
+get_invocation_alias() {
+    local base
+    base=$(basename "$0")
+
+    if [[ "$base" =~ ^helios_alias_(.+)$ ]]; then
+        echo "${BASH_REMATCH[1]}"
+    elif [[ "$base" =~ ^helios-(.+)$ ]]; then
+        echo "${BASH_REMATCH[1]}"
+    elif [[ "$base" =~ ^hx-(.+)$ ]]; then
+        echo "${BASH_REMATCH[1]}"
+    fi
+}
+
+resolve_profiles() {
+    local cli_profiles="$1"
+    local alias_name="$2"
+    local appid="$3"
+
+    log_verbose "Profile resolution: cli='$cli_profiles' alias='$alias_name' appid='$appid'"
+
+    if [[ -n "$cli_profiles" ]]; then
+        log_verbose "Source: CLI flags"
+        echo "$cli_profiles"
+        return 0
+    fi
+
+    if [[ -n "$alias_name" ]]; then
+        local alias_key="HELIOS_ALIAS_${alias_name}"
+        if [[ -n "${CONFIG[$alias_key]:-}" ]]; then
+            log_verbose "Source: symlink alias '$alias_name' -> ${CONFIG[$alias_key]}"
+            echo "${CONFIG[$alias_key]}"
+            return 0
+        fi
+        log_warn "Alias '$alias_name' not found in config (falling back)"
+    fi
+
+    if [[ -n "$appid" ]]; then
+        local app_key="HELIOS_APP_${appid}"
+        if [[ -n "${CONFIG[$app_key]:-}" ]]; then
+            log_verbose "Source: AppID override for $appid -> ${CONFIG[$app_key]}"
+            echo "${CONFIG[$app_key]}"
+            return 0
+        fi
+    fi
+
+    if [[ -n "${CONFIG[HELIOS_DEFAULT_PROFILES]:-}" ]]; then
+        log_verbose "Source: config default -> ${CONFIG[HELIOS_DEFAULT_PROFILES]}"
+        echo "${CONFIG[HELIOS_DEFAULT_PROFILES]}"
+        return 0
+    fi
+
+    log_verbose "Source: auto"
+    echo "auto"
+}
+
+# Subcommands
+
+cmd_scan() {
+    log_info "helios v$HELIOS_VERSION - System Diagnostics"
+    echo "Config path: $CONFIG_FILE"
+    echo "Cache path:  $CACHE_DIR"
+    echo
+
+    local nvidia_smi_path
+    nvidia_smi_path=$(command -v nvidia-smi 2>/dev/null) || nvidia_smi_path="NOT FOUND"
+    echo "nvidia-smi:  $nvidia_smi_path"
+
+    if [[ "$nvidia_smi_path" != "NOT FOUND" ]]; then
+        local driver_version gpu_name tier
+        driver_version=$("$nvidia_smi_path" --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -n1 || true)
+        echo "Driver:      ${driver_version:-unknown}"
+        gpu_name=$("$nvidia_smi_path" --query-gpu=name --format=csv,noheader 2>/dev/null | head -n1 || true)
+        echo "GPU:         ${gpu_name:-unknown}"
+        tier=$(detect_gpu_tier)
+        echo "Tier:        $tier"
+    fi
+
+    local steam_paths=(
+        "$HOME/.local/share/Steam"
+        "$HOME/.steam/steam"
+        "$HOME/.steam/root"
+    )
+    echo
+    echo "Steam paths:"
+    local p
+    for p in "${steam_paths[@]}"; do
+        [[ -d "$p" ]] && echo "  $p (found)" || echo "  $p (not found)"
+    done
+
+    local compat_tools_dir="$HOME/.local/share/Steam/compatibilitytools.d"
+    [[ -d "$compat_tools_dir" ]] && echo "Compat tools: $compat_tools_dir (found)" || echo "Compat tools: $compat_tools_dir (not found)"
+
+    local appid
+    appid=$(detect_appid)
+    echo "Active AppID: ${appid:-none}"
+
+    local override_count=0 alias_count=0 key
+    for key in "${!CONFIG[@]}"; do
+        [[ "$key" == HELIOS_APP_* ]] && override_count=$((override_count + 1))
+        [[ "$key" == HELIOS_ALIAS_* ]] && alias_count=$((alias_count + 1))
+    done
+    echo "App overrides: $override_count"
+    echo "Aliases:       $alias_count"
+}
+
+cmd_modes() {
+    cat <<'EOF'
+helios - Profiles and Environment Variables
+
+BASE PROFILES:
+  rt                 VKD3D_CONFIG=dxr,dxr11 PROTON_HIDE_NVIDIA_GPU=0
+  dlss               PROTON_ENABLE_NVAPI=1 DXVK_ENABLE_NVAPI=1 PROTON_HIDE_NVIDIA_GPU=0
+  perf               DXVK_ASYNC=1 __GL_SHADER_DISK_CACHE=1 __GL_SHADER_DISK_CACHE_PATH=${CACHE_DIR}/gl-shader-cache
+  fsync              PROTON_NO_ESYNC=0 PROTON_NO_FSYNC=0
+  latency            __GL_MaxFramesAllowed=1 __GL_SYNC_TO_VBLANK=0
+  ngx                PROTON_ENABLE_NGX_UPDATER=1
+  dlss_upgrade       PROTON_DLSS_UPGRADE=1
+  gplasync           DXVK_GPLASYNC=1
+  cache_size         __GL_SHADER_DISK_CACHE_SIZE=10737418240
+  cache_skip_cleanup __GL_SHADER_DISK_CACHE_SKIP_CLEANUP=1
+  vkd3d_cache        VKD3D_SHADER_CACHE_PATH=${CACHE_DIR}/vkd3d-shader-cache
+  vkd3d_latency      VKD3D_SWAPCHAIN_LATENCY_FRAMES=1
+
+META-PROFILES:
+  auto               RTX -> dlss,rt,perf | GTX -> perf | none -> pass-through
+  ultra              GPU-tiered full feature set (Blackwell/Ada -> all; Ampere -> no NGX/upgrade; Turing -> basic; GTX -> perf,latency)
+  full               dlss,rt,perf,fsync
+  comp, competitive  perf,latency
+  re_engine          dlss,rt,perf,fsync,latency,ngx,dlss_upgrade,gplasync,cache_size,cache_skip_cleanup,vkd3d_cache,vkd3d_latency
+
+PROFILE ALGEBRA:
+  Comma-separated list: dlss,rt,perf
+  + adds (default):     +rt,+dlss
+  - removes base:       auto,-rt  |  ultra,-latency,-rt
+
+ANTICHEAT FILTER:
+  For known competitive Steam AppIDs (or HELIOS_COMPETITIVE_<appid>="1"),
+  unsafe profiles (rt, dlss, ngx, dlss_upgrade, gplasync, vkd3d_cache, vkd3d_latency)
+  are stripped after expansion unless --unsafe is passed.
+
+PRIORITY ORDER:
+  1. Explicit CLI flags (--profile, --auto, --rt, ...)
+  2. Symlink invocation alias (helios-<name>, hx-<name>, helios_alias_<name>)
+  3. Saved AppID override (HELIOS_APP_<appid>)
+  4. HELIOS_DEFAULT_PROFILES in config
+  5. auto
+EOF
+}
+
+cmd_dll() {
+    local action="${1:-}"
+    shift || true
+
+    case "$action" in
+        list)
+            local dir="${1:-.}"
+            [[ -d "$dir" ]] || die "Directory not found: $dir"
+            local file size sha
+            find "$dir" -type f \( -name "nvngx_dlss*.dll" -o -name "*_nvngx.dll" \) -print0 2>/dev/null | while IFS= read -r -d '' file; do
+                size=$(stat -c%s "$file" 2>/dev/null || stat -f%z "$file" 2>/dev/null)
+                sha=$(sha256sum "$file" 2>/dev/null | cut -d' ' -f1)
+                printf '%s\t%s\t%s\n' "$file" "$size" "$sha"
+            done
+            ;;
+        backup)
+            local file="${1:-}"
+            [[ -f "$file" ]] || die "File not found: $file"
+            local ts backup
+            ts=$(date +%Y%m%d_%H%M%S)
+            backup="${file}.bak.${ts}"
+            cp -p "$file" "$backup" || die "Backup failed"
+            log_info "Backed up to $backup"
+            ;;
+        swap)
+            local target="${1:-}" new="${2:-}"
+            [[ -f "$target" ]] || die "Target not found: $target"
+            [[ -f "$new" ]] || die "New file not found: $new"
+            local magic
+            magic=$(head -c2 "$new" 2>/dev/null | od -An -tx1 | tr -d ' \n')
+            [[ "$magic" == "4d5a" ]] || die "New file is not a valid PE DLL (missing MZ magic)"
+            local ts backup
+            ts=$(date +%Y%m%d_%H%M%S)
+            backup="${target}.bak.${ts}"
+            cp -p "$target" "$backup" || die "Backup failed"
+            cp -f "$new" "$target" || die "Swap failed"
+            log_info "Swapped $target (backup: $backup)"
+            ;;
+        restore)
+            local target="${1:-}"
+            [[ -f "$target" ]] || die "Target not found: $target"
+            local latest
+            latest=$(ls -t "${target}.bak."* 2>/dev/null | head -n1 || true)
+            [[ -n "$latest" ]] || die "No backup found for $target"
+            cp -p "$latest" "$target" || die "Restore failed"
+            log_info "Restored $target from $latest"
+            ;;
+        *)
+            die "Usage: helios dll {list|backup|swap|restore} ..."
+            ;;
+    esac
+}
+
+cmd_set() {
+    local appid="${1:-}" profiles="${2:-}"
+    [[ -n "$appid" && -n "$profiles" ]] || die "Usage: helios set <appid> <profiles>"
+    [[ "$appid" =~ ^[0-9]+$ ]] || die "AppID must be numeric"
+
+    local key="HELIOS_APP_${appid}"
+    config_write_key "$key" "$profiles" "${CONFIG_OVERRIDE:-$CONFIG_FILE}"
+    log_info "Set $key=$profiles"
+}
+
+cmd_unset() {
+    local appid="${1:-}"
+    [[ -n "$appid" ]] || die "Usage: helios unset <appid>"
+    [[ "$appid" =~ ^[0-9]+$ ]] || die "AppID must be numeric"
+
+    local key="HELIOS_APP_${appid}"
+    config_delete_key "$key" "${CONFIG_OVERRIDE:-$CONFIG_FILE}"
+    log_info "Unset $key"
+}
+
+cmd_games() {
+    local found=false key
+    for key in $(printf '%s\n' "${!CONFIG[@]}" | sort); do
+        if [[ "$key" == HELIOS_APP_* ]]; then
+            printf '%s\t%s\n' "${key#HELIOS_APP_}" "${CONFIG[$key]}"
+            found=true
+        fi
+    done
+    $found || log_info "No game overrides configured"
+}
+
+cmd_alias() {
+    local action="${1:-}"
+    shift || true
+
+    case "$action" in
+        set)
+            local name="${1:-}" profiles="${2:-}"
+            [[ -n "$name" && -n "$profiles" ]] || die "Usage: helios alias set <name> <profiles>"
+            [[ "$name" =~ ^[A-Za-z0-9_-]+$ ]] || die "Alias name must match [A-Za-z0-9_-]+"
+
+            config_write_key "HELIOS_ALIAS_${name}" "$profiles" "${CONFIG_OVERRIDE:-$CONFIG_FILE}"
+            log_info "Set alias $name=$profiles"
+            ;;
+        unset)
+            local name="${1:-}"
+            [[ -n "$name" ]] || die "Usage: helios alias unset <name>"
+            [[ "$name" =~ ^[A-Za-z0-9_-]+$ ]] || die "Alias name must match [A-Za-z0-9_-]+"
+
+            config_delete_key "HELIOS_ALIAS_${name}" "${CONFIG_OVERRIDE:-$CONFIG_FILE}"
+            log_info "Unset alias $name"
+            ;;
+        list)
+            local found=false key
+            for key in $(printf '%s\n' "${!CONFIG[@]}" | sort); do
+                if [[ "$key" == HELIOS_ALIAS_* ]]; then
+                    printf '%s\t%s\n' "${key#HELIOS_ALIAS_}" "${CONFIG[$key]}"
+                    found=true
+                fi
+            done
+            $found || log_info "No aliases configured"
+            ;;
+        *)
+            die "Usage: helios alias {set|unset|list} ..."
+            ;;
+    esac
+}
+
+cmd_link() {
+    local name="${1:-}" profiles="${2:-}"
+    [[ -n "$name" ]] || die "Usage: helios link <name> [profiles]"
+    [[ "$name" =~ ^[A-Za-z0-9_-]+$ ]] || die "Link name must match [A-Za-z0-9_-]+"
+
+    local target_bin bin_dir link_path
+    target_bin=$(readlink -f "$0")
+    bin_dir=$(dirname "$target_bin")
+    link_path="${bin_dir}/helios-${name}"
+
+    if [[ -n "$profiles" ]]; then
+        cmd_alias set "$name" "$profiles"
+    fi
+
+    if [[ -L "$link_path" ]]; then
+        local current_target
+        current_target=$(readlink "$link_path")
+        if [[ "$current_target" == "$target_bin" ]]; then
+            log_info "Link already exists: $link_path"
+            return 0
+        fi
+        log_warn "Link exists with different target, replacing"
+        rm -f "$link_path"
+    elif [[ -e "$link_path" ]]; then
+        die "Path exists and is not a symlink: $link_path (refusing to overwrite)"
+    fi
+
+    ln -s "$target_bin" "$link_path" || die "Failed to create symlink"
+    log_info "Created link: $link_path -> $target_bin"
+}
+
+cmd_unlink() {
+    local name="${1:-}"
+    local purge=false
+    [[ "${2:-}" == "--purge" ]] && purge=true
+    [[ -n "$name" ]] || die "Usage: helios unlink <name> [--purge]"
+    [[ "$name" =~ ^[A-Za-z0-9_-]+$ ]] || die "Link name must match [A-Za-z0-9_-]+"
+
+    local my_bin bin_dir link_path
+    my_bin=$(readlink -f "$0")
+    bin_dir=$(dirname "$my_bin")
+    link_path="${bin_dir}/helios-${name}"
+
+    if [[ -L "$link_path" ]]; then
+        local target
+        target=$(readlink "$link_path")
+        if [[ "$target" == "$my_bin" ]]; then
+            rm -f "$link_path"
+            log_info "Removed link: $link_path"
+        else
+            log_warn "Link points elsewhere, not removing: $link_path -> $target"
+        fi
+    else
+        log_warn "Link not found: $link_path"
+    fi
+
+    if $purge; then
+        cmd_alias unset "$name"
+    fi
+}
+
+cmd_links() {
+    local my_bin bin_dir link target name profiles
+    my_bin=$(readlink -f "$0")
+    bin_dir=$(dirname "$my_bin")
+
+    for link in "$bin_dir"/helios-* "$bin_dir"/hx-* "$bin_dir"/helios_alias_*; do
+        [[ -L "$link" ]] || continue
+        target=$(readlink "$link")
+        [[ "$target" == "$my_bin" ]] || continue
+        name=$(basename "$link")
+        name="${name#helios_alias_}"
+        name="${name#helios-}"
+        name="${name#hx-}"
+        profiles="${CONFIG[HELIOS_ALIAS_${name}]:-}"
+        printf '%s\t%s\n' "$name" "${profiles:-(no alias config)}"
+    done
+}
+
+cmd_diff() {
+    local a="${1:-}" b="${2:-}"
+    [[ -n "$a" && -n "$b" ]] || die "Usage: helios diff <profile-a> <profile-b>"
+
+    local gpu_tier battery_profile expanded_a expanded_b
+    gpu_tier=$(detect_gpu_tier)
+    battery_profile="${CONFIG[HELIOS_BATTERY_PROFILE]:-}"
+
+    expanded_a=$(expand_profiles "$a" "$gpu_tier" "$battery_profile")
+    expanded_b=$(expand_profiles "$b" "$gpu_tier" "$battery_profile")
+
+    local -a vars_a vars_b
+    profile_vars "$expanded_a"
+    vars_a=("${PROFILE_VARS_RESULT[@]}")
+    profile_vars "$expanded_b"
+    vars_b=("${PROFILE_VARS_RESULT[@]}")
+
+    local -A map_a=() map_b=() all_keys=()
+    local v k
+    for v in "${vars_a[@]}"; do
+        k="${v%%=*}"
+        map_a["$k"]="${v#*=}"
+        all_keys["$k"]=1
+    done
+    for v in "${vars_b[@]}"; do
+        k="${v%%=*}"
+        map_b["$k"]="${v#*=}"
+        all_keys["$k"]=1
+    done
+
+    echo "Diff: $a vs $b"
+    echo "Expanded A: $expanded_a"
+    echo "Expanded B: $expanded_b"
+    echo
+
+    for k in $(printf '%s\n' "${!all_keys[@]}" | sort); do
+        local va="${map_a[$k]:-}" vb="${map_b[$k]:-}"
+        if [[ "$va" != "$vb" ]]; then
+            if [[ -z "$va" ]]; then
+                printf '  + %s=%s\n' "$k" "$vb"
+            elif [[ -z "$vb" ]]; then
+                printf '  - %s=%s\n' "$k" "$va"
+            else
+                printf '  ~ %s: %s -> %s\n' "$k" "$va" "$vb"
+            fi
+        fi
+    done
+}
+
+cmd_export() {
+    local file="${1:-}"
+    local -a lines=()
+    local key
+    if (( ${#CONFIG[@]} > 0 )); then
+        for key in $(printf '%s\n' "${!CONFIG[@]}" | sort); do
+            lines+=("$key=\"${CONFIG[$key]}\"")
+        done
+    fi
+
+    if [[ -n "$file" ]]; then
+        write_config_atomic "$file" "${lines[@]}"
+        log_info "Exported to $file"
+    elif (( ${#lines[@]} > 0 )); then
+        printf '%s\n' "${lines[@]}"
+    fi
+}
+
+cmd_import() {
+    local file="${1:-}"
+    local mode="${2:-merge}"
+    [[ -n "$file" ]] || die "Usage: helios import <file> [--merge|--replace]"
+    [[ -f "$file" ]] || die "File not found: $file"
+    mode="${mode#--}"
+    [[ "$mode" == "merge" || "$mode" == "replace" ]] || die "Invalid import mode: $mode (use --merge or --replace)"
+
+    local -A new_config=()
+    parse_config_file_into "$file" new_config
+
+    local config_path="${CONFIG_OVERRIDE:-$CONFIG_FILE}"
+    local -A merged=()
+    local key
+
+    if [[ "$mode" == "merge" ]]; then
+        parse_config_file_into "$config_path" merged
+    fi
+    for key in "${!new_config[@]}"; do
+        merged["$key"]="${new_config[$key]}"
+    done
+
+    local -a lines=()
+    if (( ${#merged[@]} > 0 )); then
+        for key in $(printf '%s\n' "${!merged[@]}" | sort); do
+            lines+=("$key=\"${merged[$key]}\"")
+        done
+    fi
+
+    _write_config_locked "$config_path" "${lines[@]}"
+    log_info "Imported from $file ($mode)"
+}
+
+cmd_autotune() {
+    local appid="${1:-}"
+    shift || true
+    local custom_dir=""
+    local yes=false
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --dir)
+                [[ $# -lt 2 ]] && die "--dir requires a path"
+                custom_dir="$2"
+                shift 2
+                ;;
+            --yes)
+                yes=true
+                shift
+                ;;
+            *)
+                die "Unknown autotune option: $1"
+                ;;
+        esac
+    done
+
+    [[ -n "$appid" ]] || die "Usage: helios autotune <appid> [--dir <path>] [--yes]"
+    [[ "$appid" =~ ^[0-9]+$ ]] || die "AppID must be numeric"
+
+    local game_dir=""
+    if [[ -n "$custom_dir" ]]; then
+        game_dir="$custom_dir"
+    else
+        local -a library_folders=(
+            "$HOME/.local/share/Steam/steamapps"
+            "$HOME/.steam/steam/steamapps"
+            "$HOME/.steam/root/steamapps"
+        )
+        local lib vdf line
+        for lib in "${library_folders[@]}"; do
+            vdf="$lib/libraryfolders.vdf"
+            [[ -f "$vdf" ]] || continue
+            while IFS= read -r line; do
+                if [[ "$line" =~ \"path\"[[:space:]]+\"([^\"]+)\" ]]; then
+                    library_folders+=("${BASH_REMATCH[1]}/steamapps")
+                fi
+            done < "$vdf"
+        done
+
+        for lib in "${library_folders[@]}"; do
+            local manifest="$lib/appmanifest_${appid}.acf"
+            if [[ -f "$manifest" ]]; then
+                local installdir
+                installdir=$(grep '"installdir"' "$manifest" | head -n1 | sed 's/.*"installdir"[[:space:]]*"\([^"]*\)".*/\1/' || true)
+                if [[ -n "$installdir" ]]; then
+                    if [[ -d "$lib/common/$installdir" ]]; then
+                        game_dir="$lib/common/$installdir"
+                    elif [[ -d "$lib/$installdir" ]]; then
+                        game_dir="$lib/$installdir"
+                    fi
+                    [[ -n "$game_dir" ]] && break
+                fi
+            fi
+        done
+    fi
+
+    [[ -n "$game_dir" && -d "$game_dir" ]] || die "Game directory not found for AppID $appid (use --dir)"
+
+    log_info "Scanning: $game_dir"
+
+    local has_dlss=false has_dx12=false file fname
+    while IFS= read -r -d '' file; do
+        fname=$(basename "$file")
+        [[ "$fname" == nvngx_dlss*.dll ]] && has_dlss=true
+        [[ "$fname" == d3d12.dll || "$fname" == D3D12Core.dll ]] && has_dx12=true
+    done < <(find "$game_dir" -type f \( -name "nvngx_dlss*.dll" -o -name "d3d12.dll" -o -name "D3D12Core.dll" \) -print0 2>/dev/null)
+
+    [[ -d "$game_dir/Engine/Binaries/Win64" ]] && has_dx12=true
+    find "$game_dir" -name "*.pak" -print -quit 2>/dev/null | grep -q . && has_dx12=true
+
+    local recommendation="perf"
+    if $has_dlss; then
+        recommendation="dlss,perf"
+        $has_dx12 && recommendation="dlss,rt,perf"
+    fi
+
+    log_info "Detected: DLSS=$has_dlss DX12=$has_dx12"
+    log_info "Recommendation: $recommendation"
+    printf 'helios set %s %s\n' "$appid" "$recommendation"
+
+    if $yes; then
+        cmd_set "$appid" "$recommendation"
+    fi
+}
+
+cmd_version() {
+    echo "helios v$HELIOS_VERSION"
+}
+
+cmd_help() {
+    cat <<'EOF'
+helios - Steam launch option wrapper for NVIDIA GPUs on Linux
+Version: 1.0.0
+
+USAGE:
+  helios [flags] [--] <command> [args...]
+  helios run [flags] -- <command> [args...]
+  helios <subcommand> [args...]
+
+GLOBAL FLAGS:
+  --config <file>    Use alternative config file
+  --verbose, -v      Print resolved profiles and env vars to stderr
+  --dry-run          Print resolved command without executing
+  --force            Override non-critical warnings
+  --unsafe           Bypass anticheat profile filtering
+  --help, -h         Show this help
+  --version, -V      Show version
+
+WRAPPER FLAGS:
+  --auto             GPU-detected defaults
+  --full             dlss,rt,perf,fsync
+  --ultra            GPU-tiered full feature set
+  --comp             perf,latency (alias: --competitive)
+  --rt / --no-rt
+  --dlss / --no-dlss
+  --perf / --no-perf
+  --fsync / --no-fsync
+  --latency / --no-latency
+  --ngx / --no-ngx
+  --dlss-upgrade / --no-dlss-upgrade
+  --gplasync / --no-gplasync
+  --cache-size / --no-cache-size
+  --cache-skip-cleanup / --no-cache-skip-cleanup
+  --vkd3d-cache / --no-vkd3d-cache
+  --vkd3d-latency / --no-vkd3d-latency
+  --profile=<list>   Comma-separated profile list with + and - (e.g. auto,-rt)
+
+SUBCOMMANDS:
+  scan, doctor                        System diagnostics (GPU, driver, Steam, config)
+  modes, profiles                     List profiles, env vars, and priority rules
+  dll list <dir>                      Find nvngx_dlss*.dll with size and SHA256
+  dll backup <file.dll>               Timestamped backup of a DLL
+  dll swap <target> <new>             Backup target and replace with PE DLL
+  dll restore <target>                Restore most recent backup
+  set <appid> <profiles>              Set per-game override
+  unset <appid>                       Remove per-game override
+  games                               List per-game overrides
+  alias set|unset|list ...            Manage named aliases
+  link <name> [profiles]              Create helios-<name> symlink
+  unlink <name> [--purge]             Remove symlink (and alias with --purge)
+  links                               List helios symlinks
+  diff <a> <b>                        Compare env vars between two profiles
+  export [file]                       Export valid config
+  import <file> [--merge|--replace]   Import config
+  autotune <appid> [--dir p] [--yes]  Inspect game dir and suggest/set profile
+  version, help
+
+EXAMPLES:
+  helios --auto --full -- %command%
+  helios --auto --no-rt -- %command%
+  helios --profile=auto,-rt -- %command%
+  helios run --ultra -- %command%
+  helios set 1091500 ultra
+  helios autotune 1091500 --yes
+EOF
+}
+
+execute_game() {
+    local profiles_str="$1"
+    shift
+    local game_cmd=("$@")
+
+    mkdir -p "$CACHE_DIR" 2>/dev/null || log_warn "Failed to create cache dir: $CACHE_DIR"
+
+    local gpu_tier battery_profile expanded
+    gpu_tier=$(detect_gpu_tier)
+    battery_profile="${CONFIG[HELIOS_BATTERY_PROFILE]:-}"
+    expanded=$(expand_profiles "$profiles_str" "$gpu_tier" "$battery_profile")
+    expanded=$(filter_unsafe_base_profiles "$expanded")
+
+    profile_vars "$expanded"
+
+    if $DRY_RUN || $VERBOSE; then
+        log_verbose "Resolved profiles: $profiles_str"
+        log_verbose "GPU tier: $gpu_tier"
+        log_verbose "Expanded base profiles: $expanded"
+        log_verbose "Environment variables:"
+        local v
+        for v in "${PROFILE_VARS_RESULT[@]}"; do
+            log_verbose "  $v"
+        done
+        log_verbose "Command: $(printf '%q ' "${game_cmd[@]}")"
+    fi
+
+    if $DRY_RUN; then
+        printf '[helios] DRY-RUN: would exec env'
+        local v arg
+        for v in "${PROFILE_VARS_RESULT[@]}"; do
+            printf ' %s' "$v"
+        done
+        printf ' --'
+        for arg in "${game_cmd[@]}"; do
+            printf ' %q' "$arg"
+        done
+        printf '\n'
+        return 0
+    fi
+
+    local -a env_args=("${PROFILE_VARS_RESULT[@]}")
+    shopt -s execfail
+    if (( ${#env_args[@]} > 0 )); then
+        exec env "${env_args[@]}" "${game_cmd[@]}" || exec "${game_cmd[@]}"
+    else
+        exec "${game_cmd[@]}"
+    fi
+}
+
+main() {
+    parse_global_flags "$@"
+    set -- "${REMAINING_ARGS[@]}"
+
+    load_config "${CONFIG_OVERRIDE:-$CONFIG_FILE}"
+
+    local first_arg="${1:-}"
+    case "$first_arg" in
+        scan|doctor) cmd_scan; return 0 ;;
+        modes|profiles) cmd_modes; return 0 ;;
+        dll) shift; cmd_dll "$@"; return 0 ;;
+        set) shift; cmd_set "$@"; return 0 ;;
+        unset) shift; cmd_unset "$@"; return 0 ;;
+        games) cmd_games; return 0 ;;
+        alias) shift; cmd_alias "$@"; return 0 ;;
+        link) shift; cmd_link "$@"; return 0 ;;
+        unlink) shift; cmd_unlink "$@"; return 0 ;;
+        links) cmd_links; return 0 ;;
+        diff) shift; cmd_diff "$@"; return 0 ;;
+        export) shift; cmd_export "$@"; return 0 ;;
+        import) shift; cmd_import "$@"; return 0 ;;
+        autotune) shift; cmd_autotune "$@"; return 0 ;;
+        version|--version|-V) cmd_version; return 0 ;;
+        help|--help|-h) cmd_help; return 0 ;;
+        run) shift ;;
+        "") die "No command provided. Use 'helios --help' for usage." ;;
+    esac
+
+    parse_wrapper_args "$@"
+
+    local cli_profile=""
+    local -a new_wrapper=()
+    local i=0 arg
+    while (( i < ${#WRAPPER_ARGS[@]} )); do
+        arg="${WRAPPER_ARGS[$i]}"
+        if [[ "$arg" == --profile=* ]]; then
+            cli_profile="${arg#*=}"
+        elif [[ "$arg" == "--profile" ]]; then
+            if (( i + 1 < ${#WRAPPER_ARGS[@]} )); then
+                i=$((i + 1))
+                cli_profile="${WRAPPER_ARGS[$i]}"
+            else
+                die "--profile requires a value"
+            fi
+        else
+            new_wrapper+=("$arg")
+        fi
+        i=$((i + 1))
+    done
+    WRAPPER_ARGS=("${new_wrapper[@]}")
+
+    local direct_profiles
+    direct_profiles=$(parse_direct_flags)
+
+    if [[ -n "$cli_profile" && -n "$direct_profiles" ]]; then
+        cli_profile="${cli_profile},${direct_profiles}"
+    elif [[ -z "$cli_profile" ]]; then
+        cli_profile="$direct_profiles"
+    fi
+
+    local alias_name appid resolved_profiles
+    alias_name=$(get_invocation_alias)
+    appid=$(detect_appid)
+    resolved_profiles=$(resolve_profiles "$cli_profile" "$alias_name" "$appid")
+
+    [[ ${#GAME_COMMAND[@]} -gt 0 ]] || die "No game command provided (use -- separator or provide command)"
+
+    execute_game "$resolved_profiles" "${GAME_COMMAND[@]}"
+}
+
+main "$@"

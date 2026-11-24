@@ -1,0 +1,35 @@
+# Helios configuration file
+# Install path: ~/.config/helios/helios.conf
+#
+# Syntax: KEY="value" or KEY='value'
+# Values containing $ ` ; | & < > ( ) \ are rejected.
+
+# Default profile applied when no CLI flags, alias, or AppID override matches.
+# Examples: "auto", "ultra", "full", "comp", "auto,-rt", "dlss,perf"
+HELIOS_DEFAULT_PROFILES="auto"
+
+# Per-game overrides (HELIOS_APP_<SteamAppId>="profiles")
+# Manage with: helios set <appid> <profiles>
+# HELIOS_APP_1091500="ultra"           # Cyberpunk 2077
+# HELIOS_APP_1245620="dlss,rt,perf"    # Elden Ring
+# HELIOS_APP_292030="comp"             # The Witcher 3
+# HELIOS_APP_1174180="auto,-rt"        # Red Dead Redemption 2
+
+# Symlink aliases (HELIOS_ALIAS_<name>="profiles")
+# Manage with: helios alias set <name> <profiles> | helios link <name>
+HELIOS_ALIAS_ultra="ultra"
+HELIOS_ALIAS_full="full"
+HELIOS_ALIAS_comp="comp"
+HELIOS_ALIAS_competitive="comp"
+HELIOS_ALIAS_no-rt="auto,-rt"
+HELIOS_ALIAS_battery="perf"
+
+# Custom profiles (HELIOS_PROFILE_<name>="VAR1=val VAR2=val")
+# HELIOS_PROFILE_mycustom="DXVK_HUD=fps PROTON_ENABLE_NVAPI=1"
+
+# Competitive games with anticheat (HELIOS_COMPETITIVE_<appid>="1")
+# Built-in list already covers CS2, Apex, Destiny 2, R6 Siege, PUBG, BF2042, CoD, OW2.
+# HELIOS_COMPETITIVE_123456="1"
+
+# Profile used instead of 'auto' / 'ultra' when running on battery (Discharging).
+HELIOS_BATTERY_PROFILE="perf"
